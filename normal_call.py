@@ -24,8 +24,10 @@ def testing_tf():
       n_data = 0
       for batch_idx in range(3):
         print '>>>>>>>>>>>>>> before run batch', batch_idx
+        ## it should be some debug printing here, but nothing come out when batch_idx>0
         label,sign = sess.run(iter_op)
         print '>>>>>>>>>>>>>> after run batch', batch_idx
+        ## the content of sign remain the same every time
         print sign
         if len(label) == 0:
           break
