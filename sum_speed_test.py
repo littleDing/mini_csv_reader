@@ -6,8 +6,7 @@ import os
 import tensorflow as tf
 import time
 import logging
-from threading import Thread, Lock, Semaphore
-import Queue
+from threading import Thread, Lock
 ops = tf.load_op_library('./libuser_ops.so') 
 logging.basicConfig(level=logging.INFO,format='%(asctime)s %(funcName)s@%(filename)s#%(lineno)d %(levelname)s %(message)s')
 
@@ -36,12 +35,10 @@ class SpeedTestCase(object):
         input_data_schema, feas, batch_size, label = get_simple_format()
         with tf.Graph().as_default():
             with tf.device('/cpu:0'):
-                paths = [path] if type(path)==str else path
-                self.prepare(paths, 1)
+                self.prepare([path], 1)
                 init_op = [tf.global_variables_initializer(), tf.local_variables_initializer() ]
             with tf.Session() as sess:
                 sess.run(init_op)
-                self.set_session(sess)
                 n_data = 0
                 for label,sign in self.iter_one(sess, 0, 1):
                     if len(label) == 0 : 
@@ -69,7 +66,6 @@ class SpeedTestCase(object):
                         n_data_holder[0] += len(label)
             with tf.Session(config=session_config) as sess:
                 sess.run(init_op)
-                self.set_session(sess)
                 ts = []
                 for wid in range(n_thread):
                     t = Thread(target=worker_thread, args=(wid,))
@@ -80,8 +76,6 @@ class SpeedTestCase(object):
         logging.info('finally %d data loaded'%(n_data_holder[0]))
     def prepare(self, paths, n_thread):
         raise NotImplementedError()
-    def set_session(self, sess):
-        pass
     def iter_one(self, sess, worker_idx, total_worker):
         raise NotImplementedError()
 
@@ -100,100 +94,6 @@ class CaseHandwriteOp(SpeedTestCase):
                 if len(label) == 0:
                     break
                 yield label,sign
-class CaseHandwriteOpWithTFQueue(SpeedTestCase):
-    def __init__(self, n_thread=4):
-        self.n_thread = n_thread
-    def prepare(self, paths, n_thread):
-        input_data_schema, feas, batch_size, label = get_simple_format()
-        self.iter_ops = [ ops.csv_iter(path, input_data_schema, feas, batch_size=batch_size, label=label)
-                            for path in paths ] 
-        queue = tf.FIFOQueue(10, [tf.float32, tf.int64])
-        self.tf_label = tf.placeholder(tf.float32)
-        self.tf_sign  = tf.placeholder(tf.int64)
-        self.enqueue_op = queue.enqueue([self.tf_label, self.tf_sign])
-        self.dequeue_op = queue.dequeue()
-        self.close_queue_op = queue.close()
-        self.is_queue_close_op = queue.is_closed()
-        self.queue_size_op = queue.size()
-    def set_session(self, sess):
-        sema = Semaphore(0)
-        def producer(worker_idx, total_worker):
-            for i in range(len(self.iter_ops)):
-                if i % total_worker != worker_idx :
-                    continue
-                iter_op = self.iter_ops[i]
-                while True:
-                    label,sign = sess.run(iter_op)
-                    if len(label) == 0:
-                        break
-                    feed_dict = {
-                        self.tf_label : label,
-                        self.tf_sign  : sign,
-                    }
-                    sess.run(self.enqueue_op, feed_dict=feed_dict)
-            sema.release()
-        for i in range(self.n_thread):
-            t = Thread(target=producer, args=(i, self.n_thread))
-            t.start()
-        def queue_watchman():
-            for i in range(self.n_thread):
-                sema.acquire()
-            while sess.run(self.queue_size_op) > 0 :
-                time.sleep(1)
-            sess.run(self.close_queue_op)
-        Thread(target=queue_watchman).start()
-    def iter_one(self, sess, worker_idx, total_worker):
-        try :
-            while not sess.run(self.is_queue_close_op):
-                yield sess.run(self.dequeue_op)
-        except tf.errors.OutOfRangeError:
-            print 'iter data over'
-class CaseHandwriteOpWithPYQueue(SpeedTestCase):
-    def __init__(self, n_thread=4):
-        self.n_thread = n_thread
-    def prepare(self, paths, n_thread):
-        input_data_schema, feas, batch_size, label = get_simple_format()
-        self.iter_ops = [ ops.csv_iter(path, input_data_schema, feas, batch_size=batch_size, label=label)
-                            for path in paths ] 
-    def set_session(self, sess):
-        self.queue = queue = Queue.Queue(self.n_thread)
-        sema = Semaphore(0)
-        def producer(worker_idx, total_worker):
-            for i in range(len(self.iter_ops)):
-                if i % total_worker != worker_idx :
-                    continue
-                iter_op = self.iter_ops[i]
-                while True:
-                    label,sign = sess.run(iter_op)
-                    if len(label) == 0:
-                        break
-                    queue.put((label, sign))
-            sema.release()
-        for i in range(self.n_thread):
-            t = Thread(target=producer, args=(i, self.n_thread))
-            t.start()
-        self.queue_closed = False
-        def queue_watchman():
-            for i in range(self.n_thread):
-                sema.acquire()
-            queue.join()
-            self.queue_closed = True
-        Thread(target=queue_watchman).start()
-    def iter_one(self, sess, worker_idx, total_worker):
-        try :
-            while True:
-                try :
-                    label,sign = self.queue.get(timeout=0.1)
-                    yield label,sign
-                    self.queue.task_done()
-                except Queue.Empty:
-                    if self.queue_closed:
-                        break
-                    else :
-                        print 'get data error'
-        except tf.errors.OutOfRangeError:
-            print 'iter data over'
-
 
 @log_run_time
 def testing_hand_write_op(path='./sample_data.txt', debug=False):
@@ -201,20 +101,12 @@ def testing_hand_write_op(path='./sample_data.txt', debug=False):
     calling hand write cpp op code
     '''
     CaseHandwriteOp().run_single_thread(path, debug) 
-
-
 @log_run_time
 def testing_hand_write_op_multithread(paths=['./sample_data.txt'], n_thread=1, debug=False):
     '''
     calling hand write cpp op code
     '''
     CaseHandwriteOp().run_multi_thread(paths, n_thread, debug) 
-@log_run_time
-def testing_hand_write_op_multithread_with_tfqueue(paths=['./sample_data.txt'], n_thread=1, debug=False):
-    CaseHandwriteOpWithTFQueue(n_thread).run_single_thread(paths, debug) 
-@log_run_time
-def testing_hand_write_op_multithread_with_pyqueue(paths=['./sample_data.txt'], n_thread=1, debug=False):
-    CaseHandwriteOpWithPYQueue(n_thread).run_single_thread(paths, debug) 
 
 def iter_pandas_data(path, schema, feas, label, batch_size):
     batch_per_chunck = int(250*10000/batch_size)
@@ -386,8 +278,6 @@ def main(argv):
     testing_tf_data('./sample_data.int48.txt', debug=True)
     testing_hand_write_op_multithread(['./sample_data.int48.txt']*4, n_thread=4)
     testing_pandas_multithread(['./sample_data.int48.txt']*4, n_thread=4)
-    testing_hand_write_op_multithread_with_pyqueue(['./sample_data.int48.txt']*4, n_thread=4)
-    testing_hand_write_op_multithread_with_tfqueue(['./sample_data.int48.txt']*4, n_thread=4)
 
     # warm up big files, let linux load it into cache first
     warm_up('./sample_data.int48.1m.txt')
@@ -405,10 +295,6 @@ def main(argv):
     #testing_hand_write_op_multithread(['./sample_data.int48.1m.txt']*4, n_thread=4)
     # ~148 seconds 
     #testing_pandas_multithread(['./sample_data.int48.1m.txt']*4, n_thread=4)
-    # ~355 seconds with tf.queue
-    #testing_hand_write_op_multithread_with_tfqueue(['./sample_data.int48.1m.txt']*4, n_thread=4)
-    # ~117 seconds with python queue
-    #testing_hand_write_op_multithread_with_pyqueue(['./sample_data.int48.1m.txt']*4, n_thread=4)
 
     # for 8-thread 
     # ~214 seconds under default session config
@@ -431,24 +317,11 @@ def main(argv):
     # ~5.74 seconds for 2core
     # ~4.84 seconds for 4core
     # ~4.82 seconds for 8core
-    # ~6.02 seconds for no openmp
-    #testing_hand_write_op_multithread(['./sample_data.int48.1m.txt']*4, n_thread=4)
+    testing_hand_write_op_multithread(['./sample_data.int48.1m.txt']*4, n_thread=4)
     # ~4.56 seconds
     #testing_pandas_multithread(['./sample_data.int48.1m.txt']*4, n_thread=4)
-    # ~7.28 with python queue
-    #testing_hand_write_op_multithread_with_pyqueue(['./sample_data.int48.1m.txt']*4, n_thread=4)
-    # ~7.63 with tf queue
-    #testing_hand_write_op_multithread_with_tfqueue(['./sample_data.int48.1m.txt']*4, n_thread=4)
 
-    # for 8-thread 
-    # ~6.2 seconds
-    #testing_pandas_multithread(['./sample_data.int48.1m.txt']*8, n_thread=8)
-    # ~6.9 seconds for no openmp
-    #testing_hand_write_op_multithread(['./sample_data.int48.1m.txt']*8, n_thread=8)
-    # ~7.89 seconds with python queue
-    #testing_hand_write_op_multithread_with_pyqueue(['./sample_data.int48.1m.txt']*8, n_thread=8)
-    # ~9.39 seconds with tf queue
-    #testing_hand_write_op_multithread_with_tfqueue(['./sample_data.int48.1m.txt']*8, n_thread=8)
+
 
 if __name__ == '__main__':
     tf.app.run()

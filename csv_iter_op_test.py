@@ -19,7 +19,6 @@ class CSVIterOpTest(tf.test.TestCase):
     iter_op = ops.csv_iter('./sample_data.txt', input_data_schema, feas, batch_size=batch_size, label='label2')
     with self.test_session() as sess:
       label,sign = sess.run(iter_op)
-      print label
 
       self.assertAllEqual(label.shape, [batch_size])
       self.assertAllEqual(sign.shape, [batch_size, len(feas)])
